@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Save and switch Claude Code logins (macOS).
+
+Claude Code keeps its login in two places: the Keychain item
+"Claude Code-credentials" (OAuth tokens) and `oauthAccount` in ~/.claude.json.
+Each profile is a snapshot of both, stored in its own Keychain item
+"claude-acct:<name>", so no token ever lands in a plain file.
+
+  claudec save <name>   snapshot the current login as <name>
+  claudec use <name>    switch to <name> (restart claude afterwards)
+  claudec list          list profiles, * marks the active one
+  claudec rm <name>     delete a profile
+
+Before switching, the active login is written back to its own profile, so
+tokens Claude refreshed since the last save are kept.
+"""
+import getpass
+import json
+import os
+import subprocess
+import sys
+
+CRED_SVC = "Claude Code-credentials"
+PREFIX = "claude-acct:"
+USER = getpass.getuser()
+CONFIG = os.path.expanduser("~/.claude.json")
+
+
+def kc_get(svc):
+    r = subprocess.run(["security", "find-generic-password", "-s", svc, "-a", USER, "-w"],
+                       capture_output=True, text=True)
+    return r.stdout.rstrip("\n") if r.returncode == 0 else None
+
+
+def kc_set(svc, value):
+    subprocess.run(["security", "add-generic-password", "-U", "-s", svc, "-a", USER, "-w", value],
+                   check=True, capture_output=True)
+
+
+def profiles():
+    dump = subprocess.run(["security", "dump-keychain"], capture_output=True, text=True).stdout
+    names = set()
+    for line in dump.splitlines():
+        if '"svce"<blob>="' + PREFIX in line:
+            names.add(line.split('="' + PREFIX, 1)[1].rstrip('"'))
+    return sorted(names)
+
+
+def read_config():
+    if not os.path.exists(CONFIG):
+        return {}
+    with open(CONFIG) as f:
+        return json.load(f)
+
+
+def current():
+    cred = kc_get(CRED_SVC)
+    if cred is None:
+        sys.exit("No Claude Code login in Keychain. Run `claude` and /login first.")
+    return {"cred": cred, "oauthAccount": read_config().get("oauthAccount")}
+
+
+def load(name):
+    raw = kc_get(PREFIX + name)
+    if raw is None:
+        sys.exit(f"No profile '{name}'. See `claudec list`.")
+    return json.loads(raw)
+
+
+def active_name():
+    uuid = (read_config().get("oauthAccount") or {}).get("accountUuid")
+    for n in profiles():
+        if (load(n).get("oauthAccount") or {}).get("accountUuid") == uuid:
+            return n
+    return None
+
+
+def save(name):
+    snap = current()
+    kc_set(PREFIX + name, json.dumps(snap))
+    print(f"Saved '{name}' ({(snap['oauthAccount'] or {}).get('emailAddress')})")
+
+
+def use(name):
+    target = load(name)
+    active = active_name()
+    if active == name:
+        print(f"'{name}' already active")
+        return
+    if active:
+        kc_set(PREFIX + active, json.dumps(current()))
+    kc_set(CRED_SVC, target["cred"])
+    cfg = read_config()
+    cfg["oauthAccount"] = target["oauthAccount"]
+    tmp = CONFIG + ".acct-tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG)
+    print(f"Switched to '{name}' ({(target['oauthAccount'] or {}).get('emailAddress')}). "
+          "Restart running claude sessions.")
+
+
+def main():
+    cmd, *args = sys.argv[1:] or ["list"]
+    if cmd == "list":
+        active = active_name()
+        for n in profiles():
+            email = (load(n).get("oauthAccount") or {}).get("emailAddress")
+            print(f"{'*' if n == active else ' '} {n}  {email}")
+    elif cmd in ("save", "use", "rm") and len(args) == 1:
+        if cmd == "save":
+            save(args[0])
+        elif cmd == "use":
+            use(args[0])
+        else:
+            subprocess.run(["security", "delete-generic-password", "-s", PREFIX + args[0], "-a", USER],
+                           check=True, capture_output=True)
+            print(f"Removed '{args[0]}'")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()
